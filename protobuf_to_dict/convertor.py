@@ -17,6 +17,7 @@ def datetime_to_timestamp(dt):
     ts.FromDatetime(dt)
     return ts
 
+
 def timestamp_to_datetime(ts):
     dt = ts.ToDatetime()
     return dt
@@ -49,8 +50,10 @@ def repeated(type_callable):
     return lambda value_list: [type_callable(value) for value in value_list]
 
 
-def enum_label_name(field, value):
-    return field.enum_type.values_by_number[int(value)].name
+def enum_label_name(field, value, lowercase_enum_lables=False):
+    label = field.enum_type.values_by_number[int(value)].name
+    label = label.lower() if lowercase_enum_lables else label
+    return label
 
 
 def _is_map_entry(field):
@@ -60,7 +63,7 @@ def _is_map_entry(field):
 
 
 def protobuf_to_dict(pb, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=False,
-                     including_default_value_fields=False):
+                     including_default_value_fields=False, lowercase_enum_lables=False):
     result_dict = {}
     extensions = {}
     for field, value in pb.ListFields():
@@ -69,12 +72,14 @@ def protobuf_to_dict(pb, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=Fa
             value_field = field.message_type.fields_by_name['value']
             type_callable = _get_field_value_adaptor(
                 pb, value_field, type_callable_map,
-                use_enum_labels, including_default_value_fields)
+                use_enum_labels, including_default_value_fields,
+                lowercase_enum_lables)
             for k, v in value.items():
                 result_dict[field.name][k] = type_callable(v)
             continue
         type_callable = _get_field_value_adaptor(pb, field, type_callable_map,
-                                                 use_enum_labels, including_default_value_fields)
+                                                 use_enum_labels, including_default_value_fields,
+                                                 lowercase_enum_lables)
         if field.label == FieldDescriptor.LABEL_REPEATED:
             type_callable = repeated(type_callable)
 
@@ -98,6 +103,10 @@ def protobuf_to_dict(pb, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=Fa
                 continue
             if _is_map_entry(field):
                 result_dict[field.name] = {}
+            elif field.label == FieldDescriptor.LABEL_REPEATED:
+                result_dict[field.name] = []
+            elif field.type == FieldDescriptor.TYPE_ENUM and use_enum_labels:
+                result_dict[field.name] = enum_label_name(field, field.default_value, lowercase_enum_lables)
             else:
                 result_dict[field.name] = field.default_value
 
@@ -107,7 +116,7 @@ def protobuf_to_dict(pb, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=Fa
 
 
 def _get_field_value_adaptor(pb, field, type_callable_map=TYPE_CALLABLE_MAP, use_enum_labels=False,
-                             including_default_value_fields=False):
+                             including_default_value_fields=False, lowercase_enum_lables=False):
 
     if field.message_type and field.message_type.name == Timestamp_type_name:
         return timestamp_to_datetime
@@ -117,10 +126,11 @@ def _get_field_value_adaptor(pb, field, type_callable_map=TYPE_CALLABLE_MAP, use
             pb, type_callable_map=type_callable_map,
             use_enum_labels=use_enum_labels,
             including_default_value_fields=including_default_value_fields,
+            lowercase_enum_lables=lowercase_enum_lables,
         )
 
     if use_enum_labels and field.type == FieldDescriptor.TYPE_ENUM:
-        return lambda value: enum_label_name(field, value)
+        return lambda value: enum_label_name(field, value, lowercase_enum_lables)
 
     if field.type in type_callable_map:
         return type_callable_map[field.type]
@@ -133,7 +143,8 @@ REVERSE_TYPE_CALLABLE_MAP = {
 }
 
 
-def dict_to_protobuf(pb_klass_or_instance, values, type_callable_map=REVERSE_TYPE_CALLABLE_MAP, strict=True, ignore_none=False):
+def dict_to_protobuf(pb_klass_or_instance, values, type_callable_map=REVERSE_TYPE_CALLABLE_MAP,
+                     strict=True, ignore_none=False):
     """Populates a protobuf model from a dictionary.
 
     :param pb_klass_or_instance: a protobuf message class, or an protobuf instance
@@ -144,6 +155,7 @@ def dict_to_protobuf(pb_klass_or_instance, values, type_callable_map=REVERSE_TYP
        values on the target instance.
     :param bool strict: complain if keys in the map are not fields on the message.
     :param bool strict: ignore None-values of fields, treat them as empty field
+    :param bool strict: when false: accept enums both in lowercase and uppercase
     """
     if isinstance(pb_klass_or_instance, Message):
         instance = pb_klass_or_instance
@@ -159,7 +171,7 @@ def _get_field_mapping(pb, dict_value, strict):
             continue
         if key not in pb.DESCRIPTOR.fields_by_name:
             if strict:
-                raise KeyError("%s does not have a field called %s" % (pb, key))
+                raise KeyError("%s does not have a field called %s" % (type(pb), key))
             continue
         field_mapping.append((pb.DESCRIPTOR.fields_by_name[key], value, getattr(pb, key, None)))
 
@@ -188,26 +200,37 @@ def _dict_to_protobuf(pb, value, type_callable_map, strict, ignore_none):
             continue
         if field.label == FieldDescriptor.LABEL_REPEATED:
             if field.message_type and field.message_type.has_options and field.message_type.GetOptions().map_entry:
+                key_field = field.message_type.fields_by_name['key']
                 value_field = field.message_type.fields_by_name['value']
                 for key, value in input_value.items():
                     if value_field.cpp_type == FieldDescriptor.CPPTYPE_MESSAGE:
                         _dict_to_protobuf(getattr(pb, field.name)[key], value, type_callable_map, strict, ignore_none)
                     else:
-                        getattr(pb, field.name)[key] = value
+                        if ignore_none and value is None:
+                            continue
+                        try:
+                            if key_field.type in type_callable_map:
+                                key = type_callable_map[key_field.type](key)
+                            if value_field.type in type_callable_map:
+                                value = type_callable_map[value_field.type](value)
+                            getattr(pb, field.name)[key] = value
+                        except Exception as exc:
+                            raise RuntimeError(f"type: {type(pb)}, field: {field.name}, value: {value}") from exc
                 continue
             for item in input_value:
                 if field.type == FieldDescriptor.TYPE_MESSAGE:
                     m = pb_value.add()
                     _dict_to_protobuf(m, item, type_callable_map, strict, ignore_none)
                 elif field.type == FieldDescriptor.TYPE_ENUM and isinstance(item, six.string_types):
-                    pb_value.append(_string_to_enum(field, item))
+                    pb_value.append(_string_to_enum(field, item, strict))
                 else:
                     pb_value.append(item)
             continue
         if isinstance(input_value, datetime.datetime):
             input_value = datetime_to_timestamp(input_value)
             # Instead of setattr we need to use CopyFrom for composite fields
-            # Otherwise we will get AttributeError: Assignment not allowed to composite field “field name” in protocol message object
+            # Otherwise we will get AttributeError:
+            #   Assignment not allowed to composite field “field name” in protocol message object
             getattr(pb, field.name).CopyFrom(input_value)
             continue
         elif field.type == FieldDescriptor.TYPE_MESSAGE:
@@ -222,21 +245,25 @@ def _dict_to_protobuf(pb, value, type_callable_map, strict, ignore_none):
             continue
 
         if field.type == FieldDescriptor.TYPE_ENUM and isinstance(input_value, six.string_types):
-            input_value = _string_to_enum(field, input_value)
+            input_value = _string_to_enum(field, input_value, strict)
 
-        setattr(pb, field.name, input_value)
+        try:
+            setattr(pb, field.name, input_value)
+        except Exception as exc:
+            raise RuntimeError(f"type: {type(pb)}, field: {field.name}, value: {value}") from exc
 
     return pb
 
 
-def _string_to_enum(field, input_value):
-    enum_dict = field.enum_type.values_by_name
+def _string_to_enum(field, input_value, strict=False):
     try:
-        input_value = enum_dict[input_value].number
+        input_value = field.enum_type.values_by_name[input_value].number
     except KeyError:
-        raise KeyError("`%s` is not a valid value for field `%s`" % (input_value, field.name))
+        if strict:
+            raise KeyError("`%s` is not a valid value for field `%s`" % (input_value, field.name))
+        else:
+            return _string_to_enum(field, input_value.upper(), strict=True)
     return input_value
-
 
 
 def get_field_names_and_options(pb):
